@@ -48,6 +48,12 @@ html, body {
 
   min-width: 250px;
 }
+#retry {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  z-index: 1000000; padding: 14px 22px; border: 0; border-radius: 14px;
+  background: #1769aa; color: white; font-size: 17px; font-weight: bold;
+}
+#retry[hidden] { display: none; }
 </style>
 </head>
 
@@ -58,8 +64,10 @@ html, body {
   카메라에 비춰 주세요
 </div>
 
+<button id="retry" hidden type="button">카메라 다시 실행</button>
+
 <a-scene
-  mindar-image="imageTargetSrc: ./targets.mind;"
+  mindar-image="imageTargetSrc: ./targets.mind; autoStart: false; uiLoading: no; uiError: no;"
   embedded
   color-space="sRGB"
   renderer="colorManagement: true; alpha: true"
@@ -87,14 +95,100 @@ html, body {
 <script>
 const guide = document.getElementById("guide");
 const target = document.getElementById("target");
+const scene = document.querySelector("a-scene");
+const retry = document.getElementById("retry");
+let state = "waiting";
+let timer;
+let started = false;
+const instruction = "자유의 여신상 이미지를<br>카메라에 비춰 주세요";
 
+function releaseCamera() {
+  const system = scene.systems && scene.systems["mindar-image-system"];
+  // Capture video references before MindAR removes its video element.
+  const videos = new Set(document.querySelectorAll("video"));
+  if (system && system.video) videos.add(system.video);
+  if (system && started) {
+    try { system.stop(); } catch (err) { console.warn("MindAR stop", err); }
+  }
+  for (const video of videos) {
+    const stream = video.srcObject;
+    if (stream && typeof stream.getTracks === "function") {
+      stream.getTracks().forEach(track => track.stop());
+      video.srcObject = null;
+    }
+  }
+}
+
+function fail(message, error) {
+  if (state === "failed" || state === "closed") return;
+  state = "failed";
+  clearTimeout(timer);
+  console.error("AR initialization", error || message);
+  releaseCamera();
+  guide.textContent = message;
+  retry.hidden = false;
+}
+
+function startAR() {
+  if (state !== "waiting") return;
+  if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    fail("HTTPS 접속 및 카메라 지원 브라우저를 확인해 주세요.");
+    return;
+  }
+  const system = scene.systems && scene.systems["mindar-image-system"];
+  if (!system || typeof system.start !== "function") {
+    fail("AR 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인해 주세요.");
+    return;
+  }
+  state = "starting";
+  started = true;
+  guide.textContent = "카메라를 준비하고 있습니다. 권한 요청이 나타나면 허용해 주세요.";
+  try {
+    Promise.resolve(system.start()).catch(err => {
+      fail("카메라 또는 AR 초기화 실패: " + (err.name || err.message || "알 수 없는 오류"), err);
+    });
+  } catch (err) {
+    fail("AR 실행 실패: " + (err.name || "오류"), err);
+  }
+}
+
+scene.addEventListener("arReady", () => {
+  if (state !== "starting") { releaseCamera(); return; }
+  clearTimeout(timer);
+  state = "ready";
+  guide.innerHTML = instruction;
+});
+scene.addEventListener("arError", event => {
+  const detail = event.detail || {};
+  fail("카메라 또는 AR 실행 실패. 권한과 인터넷 연결을 확인한 후 다시 실행해 주세요.", detail);
+});
 target.addEventListener("targetFound", () => {
-  guide.innerHTML = "자유의 여신상 AR정보가<br>표시되었습니다";
+  if (state === "ready") guide.innerHTML = "자유의 여신상 AR정보가<br>표시되었습니다";
+});
+target.addEventListener("targetLost", () => {
+  if (state === "ready") guide.innerHTML = instruction;
 });
 
-target.addEventListener("targetLost", () => {
-  guide.innerHTML = "자유의 여신상 이미지를<br>카메라에 비춰 주세요";
+// Reload rather than starting a second MindAR session in the same document.
+retry.addEventListener("click", () => {
+  releaseCamera();
+  location.reload();
 });
+window.addEventListener("pagehide", () => {
+  state = "closed";
+  clearTimeout(timer);
+  releaseCamera();
+});
+window.addEventListener("pageshow", event => {
+  if (event.persisted) location.reload();
+});
+
+guide.textContent = "AR 체험을 준비하고 있습니다.";
+timer = setTimeout(() => {
+  fail("AR 준비 시간이 초과되었습니다. 카메라 권한과 인터넷 연결을 확인한 후 다시 실행해 주세요.");
+}, 30000);
+if (scene.hasLoaded) startAR();
+else scene.addEventListener("loaded", startAR, { once: true });
 </script>
 
 </body>
