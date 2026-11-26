@@ -102,7 +102,79 @@ let timer;
 let started = false;
 const instruction = "자유의 여신상 이미지를<br>카메라에 비춰 주세요";
 
+// MindAR의 카메라 요청에만 적용되는 페이지 내부 호환성 처리.
+const ownedStreams = new Set();
+let lastCameraError = null;
+const media = navigator.mediaDevices;
+const nativeGet = media && media.getUserMedia && media.getUserMedia.bind(media);
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+function stopStream(stream) {
+  stream.getTracks().forEach(track => track.stop());
+  ownedStreams.delete(stream);
+}
+async function acquire(constraints) {
+  const stream = await nativeGet(constraints);
+  if (state === "closed" || state === "failed") {
+    stopStream(stream);
+    throw new DOMException("Session ended", "AbortError");
+  }
+  ownedStreams.add(stream);
+  return stream;
+}
+function isRear(track) {
+  const direction = track.getSettings().facingMode;
+  return direction ? direction === "environment" : /back|rear|environment|후면/i.test(track.label);
+}
+async function compatibleCamera(constraints) {
+  const video = constraints && constraints.video;
+  if (!video) return acquire(constraints);
+  const errors = [];
+  async function attempt(c) {
+    const stream = await acquire(c);
+    if (isRear(stream.getVideoTracks()[0])) return stream;
+    stopStream(stream);
+    throw new DOMException("Rear camera not confirmed", "NotFoundError");
+  }
+  try { return await attempt(constraints); }
+  catch (err) {
+    errors.push(err);
+    if (["NotAllowedError", "SecurityError", "AbortError"].includes(err.name)) { lastCameraError = err; throw err; }
+  }
+  guide.textContent = "다른 후면 카메라를 찾고 있습니다.";
+  let devices = await media.enumerateDevices();
+  // 권한 승인 전에는 장치 이름이 숨겨질 수 있다. 기본 카메라를 잠시 열어 목록을 확보한다.
+  if (!devices.some(d => d.kind === "videoinput" && d.label)) {
+    try {
+      const probe = await acquire({video:true, audio:false});
+      try {
+        if (isRear(probe.getVideoTracks()[0])) return probe;
+        devices = await media.enumerateDevices();
+      } finally {
+        if (!isRear(probe.getVideoTracks()[0])) stopStream(probe);
+      }
+    } catch (err) { errors.push(err); if (["NotAllowedError", "SecurityError", "AbortError"].includes(err.name)) { lastCameraError = err; throw err; } }
+  }
+  const candidates = devices.filter(d => d.kind === "videoinput" && d.deviceId && !/front|user|전면/i.test(d.label));
+  candidates.sort((a,b) => Number(/back|rear|environment|후면/i.test(b.label))-Number(/back|rear|environment|후면/i.test(a.label)));
+  for (const d of candidates) {
+    for (const extra of [{}, {width:{ideal:640},height:{ideal:480},frameRate:{ideal:15}}]) {
+      if (state !== "starting" && state !== "ready") throw new DOMException("Session ended", "AbortError");
+      await delay(700);
+      try { return await attempt({audio:false,video:{deviceId:{exact:d.deviceId},...extra}}); }
+      catch (err) { errors.push(err); console.warn("Camera candidate failed", d.label, err.name); if (["NotAllowedError", "SecurityError", "AbortError"].includes(err.name)) { lastCameraError = err; throw err; } }
+    }
+  }
+  lastCameraError = errors[errors.length-1] || new DOMException("No rear camera", "NotFoundError");
+  throw lastCameraError;
+}
+// MindAR 1.2.5는 내부에서 getUserMedia를 호출하므로 별도 스트림을 미리 열지 않는다.
+if (nativeGet) media.getUserMedia = async function(constraints) {
+  try { return await compatibleCamera(constraints); }
+  catch (err) { lastCameraError = err; throw err; }
+};
+
 function releaseCamera() {
+  for (const stream of [...ownedStreams]) stopStream(stream);
   const system = scene.systems && scene.systems["mindar-image-system"];
   // Capture video references before MindAR removes its video element.
   const videos = new Set(document.querySelectorAll("video"));
@@ -160,7 +232,7 @@ scene.addEventListener("arReady", () => {
 });
 scene.addEventListener("arError", event => {
   const detail = event.detail || {};
-  fail("카메라 또는 AR 실행 실패. 권한과 인터넷 연결을 확인한 후 다시 실행해 주세요.", detail);
+  fail("카메라 또는 AR 실행 실패: " + (lastCameraError?.name || detail.error || "초기화 오류") + ". 다시 실행해 주세요.", lastCameraError || detail);
 });
 target.addEventListener("targetFound", () => {
   if (state === "ready") guide.innerHTML = "자유의 여신상 AR정보가<br>표시되었습니다";
@@ -186,7 +258,7 @@ window.addEventListener("pageshow", event => {
 guide.textContent = "AR 체험을 준비하고 있습니다.";
 timer = setTimeout(() => {
   fail("AR 준비 시간이 초과되었습니다. 카메라 권한과 인터넷 연결을 확인한 후 다시 실행해 주세요.");
-}, 30000);
+}, 60000);
 if (scene.hasLoaded) startAR();
 else scene.addEventListener("loaded", startAR, { once: true });
 </script>
